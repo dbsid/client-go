@@ -99,6 +99,8 @@ var (
 	TiKVOnePCTxnCounter                     *prometheus.CounterVec
 	TiKVStoreLimitErrorCounter              *prometheus.CounterVec
 	TiKVGRPCConnTransientFailureCounter     *prometheus.CounterVec
+	TiKVLocalRequestCounter                 *prometheus.CounterVec
+	TiKVLocalRequestDuration                *prometheus.HistogramVec
 	TiKVPanicCounter                        *prometheus.CounterVec
 	TiKVForwardRequestCounter               *prometheus.CounterVec
 	TiKVTSFutureWaitDuration                prometheus.Histogram
@@ -722,6 +724,25 @@ func initMetrics(namespace, subsystem string, constLabels prometheus.Labels) {
 		}, []string{LblAddress, LblStore})
 	storeMetrics = append(storeMetrics, TiKVGRPCConnTransientFailureCounter)
 
+	TiKVLocalRequestCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "local_request_total",
+			Help:        "Counter of requests served by the in-process TiKV, by result (ok, err, fallback).",
+			ConstLabels: constLabels,
+		}, []string{LblType, LblResult})
+
+	TiKVLocalRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "local_request_seconds",
+			Help:        "Duration of requests served by the in-process TiKV.",
+			Buckets:     prometheus.ExponentialBuckets(0.000005, 2, 24), // 5us ~ 42s
+			ConstLabels: constLabels,
+		}, []string{LblType})
+
 	TiKVPanicCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace:   namespace,
@@ -1234,6 +1255,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVOnePCTxnCounter)
 	prometheus.MustRegister(TiKVStoreLimitErrorCounter)
 	prometheus.MustRegister(TiKVGRPCConnTransientFailureCounter)
+	prometheus.MustRegister(TiKVLocalRequestCounter)
+	prometheus.MustRegister(TiKVLocalRequestDuration)
 	prometheus.MustRegister(TiKVPanicCounter)
 	prometheus.MustRegister(TiKVForwardRequestCounter)
 	prometheus.MustRegister(TiKVTSFutureWaitDuration)

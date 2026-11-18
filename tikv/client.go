@@ -60,6 +60,25 @@ func WithCodec(codec apicodec.Codec) ClientOpt {
 	return client.WithCodec(codec)
 }
 
+// LocalStore is a TiKV store running in the same process as the client.
+// Requests to it bypass gRPC. See client.LocalStore.
+type LocalStore = client.LocalStore
+
+// ErrLocalStoreUnavailable tells the client to fall back to gRPC.
+var ErrLocalStoreUnavailable = client.ErrLocalStoreUnavailable
+
+// WithLocalStore sets the in-process store used by the RPC client.
+func WithLocalStore(store LocalStore) ClientOpt {
+	return client.WithLocalStore(store)
+}
+
+// SetDefaultLocalStore installs the process-wide in-process store used by RPC
+// clients created without WithLocalStore. Embedded deployments call it once
+// before creating the KV store.
+func SetDefaultLocalStore(store LocalStore) {
+	client.SetDefaultLocalStore(store)
+}
+
 // Timeout durations.
 const (
 	ReadTimeoutMedium     = client.ReadTimeoutMedium

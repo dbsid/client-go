@@ -164,6 +164,9 @@ type option struct {
 	security        config.Security
 	dialTimeout     time.Duration
 	codec           apicodec.Codec
+	// localStore serves requests to an in-process TiKV without gRPC.
+	localStore    LocalStore
+	localStoreSet bool
 }
 
 // Opt is the option for the client.
@@ -365,9 +368,14 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	start := time.Now()
 	bypass := resourcecontrol.MakeRequestInfo(req).Bypass()
 	storeMetrics := connPool.getStoreMetrics(req.Context.GetPeer().GetStoreId())
+	// Requests served by the in-process store are counted in
+	// local_request_*, so request_seconds only counts gRPC requests.
+	servedLocally := false
 	defer func() {
 		elapsed := time.Since(start)
-		storeMetrics.updateRPCMetrics(req, resp, elapsed)
+		if !servedLocally {
+			storeMetrics.updateRPCMetrics(req, resp, elapsed)
+		}
 		if resp != nil && !bypass {
 			switch resp.Resp.(type) {
 			case *tikvrpc.CopStreamResponse, *tikvrpc.BatchCopStreamResponse:
@@ -387,8 +395,22 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	// TiDB RPC server supports batch RPC, but batch connection will send heart beat, It's not necessary since
 	// request to TiDB is not high frequency.
 	pri := req.GetResourceControlContext().GetOverridePriority()
+	var batchReq *tikvpb.BatchCommandsRequest_Request
+	if localStore := c.localStoreFor(addr, req); localStore != nil {
+		if batchReq = req.ToBatchCommandsRequest(); batchReq != nil {
+			defer trace.StartRegion(ctx, req.Type.String()).End()
+			localResp, fallback, localErr := sendLocalRequest(ctx, localStore, batchReq, req.Type, timeout)
+			if !fallback {
+				servedLocally = true
+				return wrapErrConn(localResp, localErr)
+			}
+		}
+	}
 	if config.GetGlobalConfig().TiKVClient.MaxBatchSize > 0 && enableBatch {
-		if batchReq := req.ToBatchCommandsRequest(); batchReq != nil {
+		if batchReq == nil {
+			batchReq = req.ToBatchCommandsRequest()
+		}
+		if batchReq != nil {
 			defer trace.StartRegion(ctx, req.Type.String()).End()
 			return wrapErrConn(sendBatchRequest(ctx, addr, req.ForwardedHost, connPool.batchConn, storeMetrics.batchReqStage, batchReq, timeout, pri))
 		}
