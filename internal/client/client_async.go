@@ -73,6 +73,11 @@ func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikv
 		return
 	}
 
+	// tidb-one: the in-process store is served without the gRPC pool.
+	if c.sendRequestAsyncLocal(ctx, addr, req, batchReq, cb, regionRPC, spanRPC, useCodec) {
+		return
+	}
+
 	// TODO(zyguan): If the client created `WithGRPCDialOptions(grpc.WithBlock())`, `getConnPool` might be blocked for
 	// a while when the corresponding conn array is uninitialized. However, since tidb won't set this option, we just
 	// keep `getConnPool` synchronous for now.
@@ -87,7 +92,6 @@ func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikv
 		return
 	}
 
-	localStore := c.localStoreFor(addr, req)
 	var (
 		storeMetrics = connPool.getStoreMetrics(req.Context.GetPeer().GetStoreId())
 		entry        = &batchCommandsEntry{
@@ -115,10 +119,8 @@ func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikv
 		// batch client metrics
 		observeBatchRequestCompletion(entry, err)
 
-		// rpc metrics; local requests are counted in local_request_* instead.
-		if localStore == nil {
-			storeMetrics.updateRPCMetrics(req, resp, elapsed)
-		}
+		// rpc metrics
+		storeMetrics.updateRPCMetrics(req, resp, elapsed)
 		if resp != nil && !resourcecontrol.MakeRequestInfo(req).Bypass() {
 			collectRUV2FromExecDetails(ctx, resp.GetExecDetailsV2())
 		}
@@ -149,10 +151,6 @@ func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikv
 	})
 
 	batchConn := connPool.batchConn
-	if localStore != nil {
-		sendLocalEntryAsync(localStore, entry, req.Type, batchConn)
-		return
-	}
 	if val, err := util.EvalFailpoint("mockBatchCommandsChannelFullOnAsyncSend"); err == nil {
 		mockBatchCommandsChannelFullOnAsyncSend(ctx, batchConn, cb, val)
 	}

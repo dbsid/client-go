@@ -161,3 +161,63 @@ func TestLocalStoreServesAsyncRequest(t *testing.T) {
 		}
 	}
 }
+
+// markPoolIdle creates the gRPC pool for addr and marks its batch connection
+// idle, as the idle detector does after idleTimeout without gRPC traffic.
+func markPoolIdle(t *testing.T, cli *RPCClient, addr string) {
+	pool, err := cli.getConnPool(addr, true)
+	require.NoError(t, err)
+	atomic.StoreUint32(&pool.batchConn.idle, 1)
+	_, err = cli.getConnPool(addr, true)
+	require.ErrorContains(t, err, "rpcClient is idle")
+}
+
+// Local requests never use the batch connection, so it goes idle every
+// idleTimeout under any load; that must not fail them.
+func TestLocalStoreIgnoresIdleGRPCPool(t *testing.T) {
+	store := &fakeLocalStore{addr: "127.0.0.1:1", storeID: 7}
+	cli := NewRPCClient(WithLocalStore(store))
+	defer cli.Close()
+	markPoolIdle(t, cli, "127.0.0.1:1")
+
+	resp, err := cli.SendRequest(context.Background(), "127.0.0.1:1", newLocalGetRequest(7), time.Second)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v-k1"), resp.Resp.(*kvrpcpb.GetResponse).GetValue())
+
+	rl := async.NewRunLoop()
+	done := make(chan struct{})
+	var (
+		gotResp *tikvrpc.Response
+		gotErr  error
+	)
+	cli.SendRequestAsync(context.Background(), "127.0.0.1:1", newLocalGetRequest(7), async.NewCallback(rl, func(resp *tikvrpc.Response, err error) {
+		gotResp, gotErr = resp, err
+		close(done)
+	}))
+	for {
+		select {
+		case <-done:
+			require.NoError(t, gotErr)
+			require.Equal(t, []byte("v-k1"), gotResp.Resp.(*kvrpcpb.GetResponse).GetValue())
+			require.EqualValues(t, 2, store.calls.Load())
+			return
+		default:
+			_, err := rl.Exec(context.Background())
+			require.NoError(t, err)
+		}
+	}
+}
+
+// A local client that never falls back does not open gRPC connections to
+// its own store.
+func TestLocalStoreDoesNotDialGRPC(t *testing.T) {
+	store := &fakeLocalStore{addr: "127.0.0.1:1", storeID: 7}
+	cli := NewRPCClient(WithLocalStore(store))
+	defer cli.Close()
+
+	_, err := cli.SendRequest(context.Background(), "127.0.0.1:1", newLocalGetRequest(7), time.Second)
+	require.NoError(t, err)
+	cli.RLock()
+	defer cli.RUnlock()
+	require.Empty(t, cli.connPools)
+}

@@ -353,6 +353,11 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		go c.recycleIdleConnArray()
 	}
 
+	// tidb-one: the in-process store is served without the gRPC pool.
+	if resp, ok, err := c.sendRequestLocal(ctx, spanRPC, addr, req, timeout); ok {
+		return resp, err
+	}
+
 	// TiDB will not send batch commands to TiFlash, to resolve the conflict with Batch Cop Request.
 	// tiflash/tiflash_mpp/tidb don't use BatchCommand.
 	enableBatch := req.StoreTp == tikvrpc.TiKV
@@ -368,14 +373,9 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	start := time.Now()
 	bypass := resourcecontrol.MakeRequestInfo(req).Bypass()
 	storeMetrics := connPool.getStoreMetrics(req.Context.GetPeer().GetStoreId())
-	// Requests served by the in-process store are counted in
-	// local_request_*, so request_seconds only counts gRPC requests.
-	servedLocally := false
 	defer func() {
 		elapsed := time.Since(start)
-		if !servedLocally {
-			storeMetrics.updateRPCMetrics(req, resp, elapsed)
-		}
+		storeMetrics.updateRPCMetrics(req, resp, elapsed)
 		if resp != nil && !bypass {
 			switch resp.Resp.(type) {
 			case *tikvrpc.CopStreamResponse, *tikvrpc.BatchCopStreamResponse:
@@ -395,22 +395,8 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	// TiDB RPC server supports batch RPC, but batch connection will send heart beat, It's not necessary since
 	// request to TiDB is not high frequency.
 	pri := req.GetResourceControlContext().GetOverridePriority()
-	var batchReq *tikvpb.BatchCommandsRequest_Request
-	if localStore := c.localStoreFor(addr, req); localStore != nil {
-		if batchReq = req.ToBatchCommandsRequest(); batchReq != nil {
-			defer trace.StartRegion(ctx, req.Type.String()).End()
-			localResp, fallback, localErr := sendLocalRequest(ctx, localStore, batchReq, req.Type, timeout)
-			if !fallback {
-				servedLocally = true
-				return wrapErrConn(localResp, localErr)
-			}
-		}
-	}
 	if config.GetGlobalConfig().TiKVClient.MaxBatchSize > 0 && enableBatch {
-		if batchReq == nil {
-			batchReq = req.ToBatchCommandsRequest()
-		}
-		if batchReq != nil {
+		if batchReq := req.ToBatchCommandsRequest(); batchReq != nil {
 			defer trace.StartRegion(ctx, req.Type.String()).End()
 			return wrapErrConn(sendBatchRequest(ctx, addr, req.ForwardedHost, connPool.batchConn, storeMetrics.batchReqStage, batchReq, timeout, pri))
 		}
