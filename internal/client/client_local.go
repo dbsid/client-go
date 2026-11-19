@@ -16,13 +16,18 @@ package client
 
 import (
 	"context"
+	"runtime/trace"
 	"sync/atomic"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pkg/errors"
+	"github.com/tikv/client-go/v2/internal/resourcecontrol"
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/client-go/v2/util/async"
 )
 
 // ErrLocalStoreUnavailable is returned by LocalStore.Call when the in-process
@@ -151,19 +156,108 @@ func sendLocalRequest(
 	return r, false, err
 }
 
-// sendLocalEntryAsync serves an async batch entry through the local store on a
-// new goroutine. On fallback it hands the untouched entry to the gRPC batch
-// connection.
-func sendLocalEntryAsync(store LocalStore, entry *batchCommandsEntry, cmdType tikvrpc.CmdType, batchConn *batchConn) {
-	go func() {
-		resp, fallback, err := callLocal(entry.ctx, store, entry.req, cmdType, 0)
-		if fallback {
-			select {
-			case batchConn.batchCommandsCh <- entry:
-			case <-entry.ctx.Done():
-			case <-batchConn.closed:
-				entry.error(errors.New("batchConn closed"))
+// sendRequestLocal serves req from the in-process store. ok is false when
+// addr is not local or the store asked for fallback; the caller then sends req
+// through gRPC.
+//
+// It runs before RPCClient.getConnPool: local requests never use the batch
+// connection, so under any load its idle detector marks the pool idle every
+// idleTimeout, and getConnPool then fails with "rpcClient is idle" until the
+// pool is recycled. A failed primary commit is reported as undetermined and
+// TiDB closes the client connection.
+func (c *RPCClient) sendRequestLocal(
+	ctx context.Context,
+	spanRPC opentracing.Span,
+	addr string,
+	req *tikvrpc.Request,
+	timeout time.Duration,
+) (resp *tikvrpc.Response, ok bool, err error) {
+	store := c.localStoreFor(addr, req)
+	if store == nil {
+		return nil, false, nil
+	}
+	batchReq := req.ToBatchCommandsRequest()
+	if batchReq == nil {
+		return nil, false, nil
+	}
+	start := time.Now()
+	defer trace.StartRegion(ctx, req.Type.String()).End()
+	resp, fallback, err := sendLocalRequest(ctx, store, batchReq, req.Type, timeout)
+	if fallback {
+		return nil, false, nil
+	}
+	if resp != nil && !resourcecontrol.MakeRequestInfo(req).Bypass() {
+		collectRUV2FromExecDetails(ctx, resp.GetExecDetailsV2())
+	}
+	if spanRPC != nil && util.TraceExecDetailsEnabled(ctx) {
+		if si := buildSpanInfoFromResp(resp); si != nil {
+			si.addTo(spanRPC, start)
+		}
+	}
+	return resp, true, err
+}
+
+// sendRequestAsyncLocal is the asynchronous counterpart of sendRequestLocal:
+// it reports false when addr is not local. Otherwise it serves the request on
+// a new goroutine and, if the store asks for fallback, queues it on the gRPC
+// batch connection. The callback mirrors the one in SendRequestAsync without
+// the gRPC request metrics.
+func (c *RPCClient) sendRequestAsyncLocal(
+	ctx context.Context,
+	addr string,
+	req *tikvrpc.Request,
+	batchReq *tikvpb.BatchCommandsRequest_Request,
+	cb async.Callback[*tikvrpc.Response],
+	regionRPC *trace.Region,
+	spanRPC opentracing.Span,
+	useCodec bool,
+) bool {
+	store := c.localStoreFor(addr, req)
+	if store == nil {
+		return false
+	}
+	if err := encodeRequestCmd(batchReq); err != nil {
+		cb.Invoke(nil, err)
+		return true
+	}
+	entry := &batchCommandsEntry{
+		ctx:           ctx,
+		req:           batchReq,
+		cb:            cb,
+		forwardedHost: req.ForwardedHost,
+		pri:           req.GetResourceControlContext().GetOverridePriority(),
+		reqArriveAt:   time.Now(),
+	}
+	var stop func() bool
+	entry.cb.Inject(func(resp *tikvrpc.Response, err error) (*tikvrpc.Response, error) {
+		if stop != nil {
+			stop()
+		}
+		if resp != nil && !resourcecontrol.MakeRequestInfo(req).Bypass() {
+			collectRUV2FromExecDetails(ctx, resp.GetExecDetailsV2())
+		}
+		if spanRPC != nil {
+			if util.TraceExecDetailsEnabled(ctx) {
+				if si := buildSpanInfoFromResp(resp); si != nil {
+					si.addTo(spanRPC, entry.reqArriveAt)
+				}
 			}
+			spanRPC.Finish()
+		}
+		regionRPC.End()
+		if useCodec && err == nil {
+			resp, err = c.option.codec.DecodeResponse(req, resp)
+		}
+		return resp, err
+	})
+	stop = context.AfterFunc(ctx, func() {
+		entry.error(ctx.Err())
+		atomic.StoreInt32(&entry.canceled, 1)
+	})
+	go func() {
+		resp, fallback, err := callLocal(entry.ctx, store, entry.req, req.Type, 0)
+		if fallback {
+			c.queueBatchEntry(addr, entry)
 			return
 		}
 		if entry.isCanceled() {
@@ -175,4 +269,21 @@ func sendLocalEntryAsync(store LocalStore, entry *batchCommandsEntry, cmdType ti
 		}
 		entry.response(resp)
 	}()
+	return true
+}
+
+// queueBatchEntry sends an encoded entry through the gRPC batch connection
+// to addr.
+func (c *RPCClient) queueBatchEntry(addr string, entry *batchCommandsEntry) {
+	connPool, err := c.getConnPool(addr, true)
+	if err != nil {
+		entry.error(err)
+		return
+	}
+	select {
+	case connPool.batchConn.batchCommandsCh <- entry:
+	case <-entry.ctx.Done():
+	case <-connPool.batchConn.closed:
+		entry.error(errors.New("batchConn closed"))
+	}
 }
