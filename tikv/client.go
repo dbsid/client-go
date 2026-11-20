@@ -64,6 +64,10 @@ func WithCodec(codec apicodec.Codec) ClientOpt {
 // Requests to it bypass gRPC. See client.LocalStore.
 type LocalStore = client.LocalStore
 
+// LocalHealthReporter is optionally implemented by a LocalStore to deliver the
+// store's health feedback. See client.LocalHealthReporter.
+type LocalHealthReporter = client.LocalHealthReporter
+
 // ErrLocalStoreUnavailable tells the client to fall back to gRPC.
 var ErrLocalStoreUnavailable = client.ErrLocalStoreUnavailable
 

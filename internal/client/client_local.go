@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pkg/errors"
 	"github.com/tikv/client-go/v2/internal/resourcecontrol"
@@ -48,8 +49,52 @@ type LocalStore interface {
 	// storeID can be 0 if the caller does not know it.
 	IsLocal(addr string, storeID uint64) bool
 	// Call executes one encoded tikvpb.BatchCommandsRequest_Request. The req
-	// buffer is only valid during the call.
+	// buffer is only valid during the call. Call must return when ctx is done
+	// or timeout (if positive) passes, as the gRPC path does, and must not
+	// hold an OS thread while the store works: callers can have thousands of
+	// requests in flight.
 	Call(ctx context.Context, req []byte, resp *tikvpb.BatchCommandsResponse_Response, timeout time.Duration) error
+}
+
+// LocalHealthReporter is implemented by a LocalStore that reports the health
+// feedback TiKV attaches to batch-commands responses over gRPC (slow score,
+// noisy resource groups). The client asks for it at most once per returned
+// interval while it sends local requests and passes it to the region cache,
+// as it does for feedback that arrives on a gRPC stream.
+type LocalHealthReporter interface {
+	HealthFeedback() (feedback *kvrpcpb.HealthFeedback, interval time.Duration, err error)
+}
+
+// localFeedbackRetry is the wait before asking again when the store has no
+// feedback (not ready, or health feedback disabled).
+const localFeedbackRetry = 10 * time.Second
+
+// maybeLocalHealthFeedback delivers the local store's health feedback when it
+// is due, or at once for an explicit GetHealthFeedback request (as TiKV
+// attaches it to the stream for one). One caller at a time fetches it; the
+// others return at once.
+func (c *RPCClient) maybeLocalHealthFeedback(store LocalStore, cmd tikvrpc.CmdType) {
+	r, ok := store.(LocalHealthReporter)
+	if !ok || c.option == nil {
+		return
+	}
+	at := &c.option.localFeedbackAt
+	now := time.Now().UnixNano()
+	next := at.Load()
+	if cmd != tikvrpc.CmdGetHealthFeedback &&
+		(now < next || !at.CompareAndSwap(next, now+int64(localFeedbackRetry))) {
+		return
+	}
+	feedback, interval, err := r.HealthFeedback()
+	if err != nil || feedback == nil {
+		return
+	}
+	if interval > 0 {
+		at.Store(now + int64(interval))
+	}
+	if h := c.eventListener.Load(); h != nil {
+		(*h).OnHealthFeedback(feedback)
+	}
 }
 
 type localStoreHolder struct {
@@ -186,6 +231,7 @@ func (c *RPCClient) sendRequestLocal(
 	if fallback {
 		return nil, false, nil
 	}
+	c.maybeLocalHealthFeedback(store, req.Type)
 	if resp != nil && !resourcecontrol.MakeRequestInfo(req).Bypass() {
 		collectRUV2FromExecDetails(ctx, resp.GetExecDetailsV2())
 	}
@@ -260,6 +306,7 @@ func (c *RPCClient) sendRequestAsyncLocal(
 			c.queueBatchEntry(addr, entry)
 			return
 		}
+		c.maybeLocalHealthFeedback(store, req.Type)
 		if entry.isCanceled() {
 			return
 		}

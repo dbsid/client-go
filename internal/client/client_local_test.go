@@ -16,6 +16,7 @@ package client
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -220,4 +221,54 @@ func TestLocalStoreDoesNotDialGRPC(t *testing.T) {
 	cli.RLock()
 	defer cli.RUnlock()
 	require.Empty(t, cli.connPools)
+}
+
+type reportingLocalStore struct {
+	fakeLocalStore
+	asked atomic.Int64
+}
+
+func (s *reportingLocalStore) HealthFeedback() (*kvrpcpb.HealthFeedback, time.Duration, error) {
+	n := s.asked.Add(1)
+	return &kvrpcpb.HealthFeedback{StoreId: s.storeID, FeedbackSeqNo: uint64(n), SlowScore: 7}, time.Hour, nil
+}
+
+type feedbackRecorder struct {
+	mu  sync.Mutex
+	got []*kvrpcpb.HealthFeedback
+}
+
+func (r *feedbackRecorder) OnHealthFeedback(f *kvrpcpb.HealthFeedback) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.got = append(r.got, f)
+}
+
+// The local store's health feedback reaches the event listener, at most once
+// per interval it asks for.
+func TestLocalStoreHealthFeedback(t *testing.T) {
+	store := &reportingLocalStore{fakeLocalStore: fakeLocalStore{addr: "127.0.0.1:1", storeID: 7}}
+	cli := NewRPCClient(WithLocalStore(store))
+	defer cli.Close()
+	rec := &feedbackRecorder{}
+	cli.SetEventListener(rec)
+
+	for range 5 {
+		_, err := cli.SendRequest(context.Background(), "127.0.0.1:1", newLocalGetRequest(7), time.Second)
+		require.NoError(t, err)
+	}
+	require.EqualValues(t, 1, store.asked.Load())
+
+	// An explicit request is answered at once.
+	req := tikvrpc.NewRequest(tikvrpc.CmdGetHealthFeedback, &kvrpcpb.GetHealthFeedbackRequest{})
+	req.Context.Peer = &metapb.Peer{StoreId: 7}
+	_, err := cli.SendRequest(context.Background(), "127.0.0.1:1", req, time.Second)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, store.asked.Load())
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.got, 2)
+	require.EqualValues(t, 7, rec.got[0].GetSlowScore())
+	require.EqualValues(t, 7, rec.got[0].GetStoreId())
 }
