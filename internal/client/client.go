@@ -167,6 +167,9 @@ type option struct {
 	// localStore serves requests to an in-process TiKV without gRPC.
 	localStore    LocalStore
 	localStoreSet bool
+	// localFeedbackAt is when to ask the local store for health feedback next
+	// (unix nanoseconds).
+	localFeedbackAt atomic.Int64
 }
 
 // Opt is the option for the client.
