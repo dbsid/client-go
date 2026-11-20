@@ -258,9 +258,17 @@ func TestLocalStoreHealthFeedback(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.EqualValues(t, 1, store.asked.Load())
+
+	// An explicit request is answered at once.
+	req := tikvrpc.NewRequest(tikvrpc.CmdGetHealthFeedback, &kvrpcpb.GetHealthFeedbackRequest{})
+	req.Context.Peer = &metapb.Peer{StoreId: 7}
+	_, err := cli.SendRequest(context.Background(), "127.0.0.1:1", req, time.Second)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, store.asked.Load())
+
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	require.Len(t, rec.got, 1)
+	require.Len(t, rec.got, 2)
 	require.EqualValues(t, 7, rec.got[0].GetSlowScore())
 	require.EqualValues(t, 7, rec.got[0].GetStoreId())
 }

@@ -70,8 +70,10 @@ type LocalHealthReporter interface {
 const localFeedbackRetry = 10 * time.Second
 
 // maybeLocalHealthFeedback delivers the local store's health feedback when it
-// is due. One caller at a time fetches it; the others return at once.
-func (c *RPCClient) maybeLocalHealthFeedback(store LocalStore) {
+// is due, or at once for an explicit GetHealthFeedback request (as TiKV
+// attaches it to the stream for one). One caller at a time fetches it; the
+// others return at once.
+func (c *RPCClient) maybeLocalHealthFeedback(store LocalStore, cmd tikvrpc.CmdType) {
 	r, ok := store.(LocalHealthReporter)
 	if !ok || c.option == nil {
 		return
@@ -79,7 +81,8 @@ func (c *RPCClient) maybeLocalHealthFeedback(store LocalStore) {
 	at := &c.option.localFeedbackAt
 	now := time.Now().UnixNano()
 	next := at.Load()
-	if now < next || !at.CompareAndSwap(next, now+int64(localFeedbackRetry)) {
+	if cmd != tikvrpc.CmdGetHealthFeedback &&
+		(now < next || !at.CompareAndSwap(next, now+int64(localFeedbackRetry))) {
 		return
 	}
 	feedback, interval, err := r.HealthFeedback()
@@ -228,7 +231,7 @@ func (c *RPCClient) sendRequestLocal(
 	if fallback {
 		return nil, false, nil
 	}
-	c.maybeLocalHealthFeedback(store)
+	c.maybeLocalHealthFeedback(store, req.Type)
 	if resp != nil && !resourcecontrol.MakeRequestInfo(req).Bypass() {
 		collectRUV2FromExecDetails(ctx, resp.GetExecDetailsV2())
 	}
@@ -303,7 +306,7 @@ func (c *RPCClient) sendRequestAsyncLocal(
 			c.queueBatchEntry(addr, entry)
 			return
 		}
-		c.maybeLocalHealthFeedback(store)
+		c.maybeLocalHealthFeedback(store, req.Type)
 		if entry.isCanceled() {
 			return
 		}
